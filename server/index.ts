@@ -1,0 +1,20 @@
+import { resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { StateStore } from './state.ts';
+import { Workbench } from './workbench.ts';
+import { createWorkbenchServer } from './http.ts';
+import { loadSources } from './sources.ts';
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const port = Number(process.env.PORT || 4310);
+if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('PORT 必须是 1024–65535 的端口号');
+const demo = process.argv.includes('--demo');
+const sources = demo ? [{ id: 'demo', name: '演示连接' }] : await loadSources(root);
+const store = new StateStore(process.env.WORKBENCH_STATE_FILE || resolve(root, '.workbench', demo ? 'demo.json' : 'state.json'));
+await store.load();
+const factory = demo ? (await import('./demo.ts')).demoFactory : undefined;
+const workbench = new Workbench(sources, store, demo, factory);
+const app = await createWorkbenchServer(workbench, { port, root, dev: process.argv.includes('--dev') });
+app.server.listen(port, '127.0.0.1', () => { console.log(`Codex 工作台${demo ? '（演示模式）' : ''}：http://127.0.0.1:${port}`); workbench.start(); });
+app.server.on('error', error => { console.error(error.message); workbench.stop(); process.exitCode = 1; });
+for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, async () => { workbench.stop(); await app.close(); process.exit(0); });
