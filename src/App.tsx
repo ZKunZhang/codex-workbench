@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import { Activity, ArrowLeft, Bell, Check, CheckCheck, ChevronDown, ChevronRight, CircleHelp, Clock3, Code2, Command, ExternalLink, Folder, GitBranch, Inbox, Layers, LoaderCircle, MessageSquare, PanelLeftClose, PanelLeftOpen, Pencil, Plus, RefreshCw, Search, Send, ShieldCheck, Square, Star, Terminal, Trash2, Unplug, X } from 'lucide-react';
 import type { Snapshot, ThreadSummary, ThreadDetail, PendingRequest, Reply, RuntimeState, WorkbenchSession } from '../shared/types.ts';
 import { api, setToken } from './api.ts';
@@ -11,6 +11,7 @@ import { ConversationItem } from './components/ConversationItem.tsx';
 import { MAX_TITLE_LENGTH, validateTitle } from '../shared/title.ts';
 import { useVisibilityPolling } from './useVisibilityPolling.ts';
 import { reconcileDetail, reconcileSnapshot } from './reconcile.ts';
+import { useApprovalNotifications } from './useApprovalNotifications.ts';
 
 const empty: Snapshot = { sources: [], threads: [], pending: [], queue: [], audit: [], revision: 0, demo: false };
 
@@ -48,6 +49,7 @@ export default function App() {
   const [showChildren, setShowChildren] = useState(true);
   const [collapsedParents, setCollapsedParents] = useState<string[]>([]);
   const [approvalCenter, setApprovalCenter] = useState(false);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => { try { const saved = localStorage.getItem('codex-workbench:sidebar-collapsed'); return saved === null ? matchMedia('(max-width: 800px)').matches : saved === 'true'; } catch { return false; } });
   const [detail, setDetail] = useState<ThreadDetail | null>(null);
   const [detailError, setDetailError] = useState('');
@@ -71,8 +73,6 @@ export default function App() {
   historyCursorRef.current = historyCursors;
   const conversationRef = useRef<HTMLDivElement>(null);
   const stickBottom = useRef(true);
-  const previousRequests = useRef(new Set<string>());
-  const notificationReady = useRef(false);
   const snapshotRef = useRef(snapshot);
   snapshotRef.current = snapshot;
   const selected = snapshot.threads.find(t => t.key === selectedKey) || null;
@@ -81,6 +81,7 @@ export default function App() {
   const requests = snapshot.pending.filter(r => r.sourceId === selected?.sourceId && r.threadId === selected?.id);
   const queued = snapshot.queue.filter(q => q.sourceId === selected?.sourceId && q.threadId === selected?.id);
   const running = !!selected && ['running', 'approval', 'input'].includes(selected.state);
+  const canSend = !!selected && connected && !busy && !!text.trim() && (!running || mode !== 'steer' || !!activeTurn);
   const target = snapshot.threads.find(t => t.key === connectTarget?.key) || connectTarget;
   const targetSource = snapshot.sources.find(s => s.id === target?.sourceId);
   const targetCommand = target && targetSource?.terminalAddress ? terminalCommand({ codexHome: target.codexHome || undefined, url: targetSource.terminalAddress }, target.id) : null;
@@ -108,10 +109,6 @@ export default function App() {
   useEffect(() => { try { localStorage.setItem('codex-workbench:favorites', JSON.stringify(favorites)); } catch { /* Preferences are optional. */ } }, [favorites]);
   useEffect(() => { try { localStorage.setItem('codex-workbench:sidebar-collapsed', String(sidebarCollapsed)); } catch { /* Preferences are optional. */ } }, [sidebarCollapsed]);
   useEffect(() => { if (notice) { const timer = setTimeout(() => setNotice(''), 4000); return () => clearTimeout(timer); } }, [notice]);
-  useEffect(() => {
-    if (notificationReady.current && 'Notification' in window && Notification.permission === 'granted') for (const request of snapshot.pending) if (!previousRequests.current.has(request.key)) new Notification('Codex 需要你处理', { body: request.title });
-    previousRequests.current = new Set(snapshot.pending.map(p => p.key)); if (connection === 'online') notificationReady.current = true;
-  }, [snapshot.pending, connection]);
 
   const refreshDetail = useCallback((initial = false, fresh = false, page?: string[]): Promise<void> => {
     if (!selected || !connected) return Promise.resolve();
@@ -152,6 +149,18 @@ export default function App() {
     while (current.parentId) { const key = `${current.sourceId}:${current.parentId}`; if (parents.includes(key)) break; parents.push(key); const parent = snapshotRef.current.threads.find(t => t.key === key); if (!parent) break; current = parent; }
     setCollapsedParents(values => values.filter(key => !parents.includes(key)));
   }, []);
+  const openNotification = useCallback((requestKey?: string) => {
+    setNotificationsOpen(false);
+    const current = snapshotRef.current;
+    const request = current.pending.find(request => request.key === requestKey);
+    const thread = request && current.threads.find(thread => thread.sourceId === request.sourceId && thread.id === request.threadId);
+    if (!thread) { setApprovalCenter(true); return; }
+    setView('all'); setProject('all'); setSourceFilter('all'); setFilter('all'); setSearch(''); setShowChildren(true);
+    setApprovalCenter(false); choose(thread);
+    if (matchMedia('(max-width: 800px)').matches) setSidebarCollapsed(true);
+  }, [choose]);
+  const notifications = useApprovalNotifications(snapshot, connection === 'online', openNotification);
+  const notificationLabel = notifications.error ? '通知异常' : notifications.allowed ? '通知已开启' : notifications.permission === 'denied' ? '通知被阻止' : notifications.permission === 'unsupported' ? '通知不可用' : '开启通知';
   const closeMobileSidebar = () => { if (matchMedia('(max-width: 800px)').matches) setSidebarCollapsed(true); };
   const showAll = () => { setView('all'); setProject('all'); setSourceFilter('all'); setFilter('all'); setSearch(''); setShowChildren(true); closeMobileSidebar(); };
   async function act(action: () => Promise<void>) {
@@ -184,8 +193,21 @@ export default function App() {
   }, [deleteReason, selectedKey]);
   async function reply(key: string, value: Reply) { await act(async () => { await api(`requests/${encodeURIComponent(key)}`, value); setNotice('回答已发送，等待 Codex 确认'); }); }
   function send(e?: FormEvent) {
-    e?.preventDefault(); if (!selected || !text.trim()) return;
+    e?.preventDefault(); if (!selected || !canSend) return;
     void act(async () => { await api(`${endpoint(selected)}/message`, { text, mode: running ? mode : 'send', requestId: crypto.randomUUID(), turnId: activeTurn?.id }); setText(''); setNotice(running && mode === 'queue' ? '已加入待发送队列' : '指令已发送'); await refreshDetail(); });
+  }
+  function composerKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    // Some IMEs report keyCode 229 even when isComposing is already false.
+    if (e.key !== 'Enter' || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+    if (e.metaKey || e.ctrlKey) {
+      e.preventDefault();
+      const input = e.currentTarget;
+      input.setRangeText('\n', input.selectionStart, input.selectionEnd, 'end');
+      setText(input.value);
+    } else if (!e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      if (!e.repeat) send();
+    }
   }
   const projects = useMemo(() => [...new Set(snapshot.threads.map(t => t.cwd))].sort(), [snapshot.threads]);
   const visibleThreads = useMemo(() => snapshot.threads.filter(t => (showChildren || !t.parentId) && (sourceFilter === 'all' || t.sourceId === sourceFilter) && (project === 'all' || t.cwd === project) && (view !== 'favorites' || favorites.includes(t.key)) && (view !== 'inbox' || ['approval', 'input', 'error'].includes(t.state) || snapshot.pending.some(r => r.sourceId === t.sourceId && r.threadId === t.id)) && (filter === 'all' || (filter === 'active' ? ['running', 'approval', 'input'].includes(t.state) || !!t.externalPid : filter === 'waiting' ? ['approval', 'input'].includes(t.state) : t.state === 'history')) && `${t.title} ${t.cwd} ${t.id} ${t.sessionId || ''} ${t.codexHome || ''}`.toLowerCase().includes(search.toLowerCase())).sort((a, b) => priority[a.state] - priority[b.state] || b.updatedAt - a.updatedAt), [snapshot.threads, snapshot.pending, showChildren, sourceFilter, project, view, favorites, filter, search]);
@@ -197,7 +219,10 @@ export default function App() {
   const tree = useMemo(() => taskTree(snapshot.threads, visibleThreads, (a, b) => priority[a.state] - priority[b.state] || b.updatedAt - a.updatedAt), [snapshot.threads, visibleThreads]);
   const favoriteKeys = useMemo(() => new Set(favorites), [favorites]);
   const collapsedKeys = useMemo(() => new Set(collapsedParents), [collapsedParents]);
-  const sourceNames = useMemo(() => new Map(snapshot.sources.map(source => [source.id, source.name])), [snapshot.sources]);
+  // Connection timestamps change on heartbeats; task labels do not. Keep the
+  // map stable so those updates do not walk the entire memoized task list.
+  const sourceLabels = JSON.stringify(snapshot.sources.map(source => [source.id, source.name]));
+  const sourceNames = useMemo(() => new Map<string, string>(JSON.parse(sourceLabels)), [sourceLabels]);
   const toggleParent = useCallback((key: string) => setCollapsedParents(values => values.includes(key) ? values.filter(value => value !== key) : [...values, key]), []);
 
   return <div className={`app ${selected ? 'has-selection' : ''} ${sidebarCollapsed ? 'sidebar-collapsed' : 'sidebar-expanded'}`}>
@@ -216,7 +241,7 @@ export default function App() {
       <div className="sidebar-bottom"><div className="nav-label">连接来源</div>{snapshot.sources.map(source => <button className={`source ${sourceFilter === source.id ? 'selected' : ''}`} key={source.id} title={source.error || source.codexHome || `上次同步：${time(source.lastSync)}`} onClick={() => { setSourceFilter(source.id); setView('all'); setProject('all'); setFilter('all'); setSearch(''); setShowChildren(true); setSelectedKey(null); closeMobileSidebar(); }}><span className={`connection-dot ${source.connected ? 'online' : 'offline'}`} /><span className="source-info"><strong>{source.name} · {snapshot.threads.filter(t => t.sourceId === source.id).length}</strong><small>{source.connected ? `已连接${source.version ? ` · ${source.version}` : ''}` : '正在重新连接'}</small></span></button>)}<div className="local-caption"><ShieldCheck size={14} />仅本机访问 · 数据保留在本机</div></div>
     </aside>
     <main className="workspace">
-      <header className="topbar"><div className="breadcrumb"><button type="button" className="icon-button sidebar-toggle" aria-label={sidebarCollapsed ? '展开左侧菜单' : '折叠左侧菜单'} title={sidebarCollapsed ? '展开左侧菜单' : '折叠左侧菜单'} aria-expanded={!sidebarCollapsed} aria-controls="workspace-navigation" onClick={() => setSidebarCollapsed(value => !value)}>{sidebarCollapsed ? <PanelLeftOpen size={20} /> : <PanelLeftClose size={20} />}</button><Command size={17} /><span>工作空间</span><ChevronRight size={14} /><strong>{pageTitle}</strong></div><div className="topbar-right"><button className={`approval-entry ${snapshot.pending.length ? 'has-pending' : ''}`} onClick={() => setApprovalCenter(true)}><ShieldCheck size={16} /><span>权限确认</span><b>{snapshot.pending.length}</b></button><IconButton label="新建会话" disabled={!snapshot.sources.some(s => s.connected)} onClick={() => { setNewSource(snapshot.sources.find(s => s.connected && (sourceFilter === 'all' || s.id === sourceFilter))?.id || ''); setNewCwd(selected?.cwd || (project !== 'all' ? project : '')); setNewTask(true); }}><Plus size={19} /></IconButton><span className={`live-label ${connection}`}><span className="connection-dot" />{connection === 'online' ? '实时同步' : connection === 'connecting' ? '正在连接' : '连接中断'}</span><IconButton label="启用浏览器通知" onClick={() => { if ('Notification' in window) void Notification.requestPermission().then(p => setNotice(p === 'granted' ? '已启用待处理通知' : '浏览器未允许通知')); else setNotice('当前浏览器不支持通知'); }}><Bell size={18} /></IconButton></div></header>
+      <header className="topbar"><div className="breadcrumb"><button type="button" className="icon-button sidebar-toggle" aria-label={sidebarCollapsed ? '展开左侧菜单' : '折叠左侧菜单'} title={sidebarCollapsed ? '展开左侧菜单' : '折叠左侧菜单'} aria-expanded={!sidebarCollapsed} aria-controls="workspace-navigation" onClick={() => setSidebarCollapsed(value => !value)}>{sidebarCollapsed ? <PanelLeftOpen size={20} /> : <PanelLeftClose size={20} />}</button><Command size={17} /><span>工作空间</span><ChevronRight size={14} /><strong>{pageTitle}</strong></div><div className="topbar-right"><button className={`approval-entry ${snapshot.pending.length ? 'has-pending' : ''}`} onClick={() => setApprovalCenter(true)}><ShieldCheck size={16} /><span>权限确认</span><b>{snapshot.pending.length}</b></button><IconButton label="新建会话" disabled={!snapshot.sources.some(s => s.connected)} onClick={() => { setNewSource(snapshot.sources.find(s => s.connected && (sourceFilter === 'all' || s.id === sourceFilter))?.id || ''); setNewCwd(selected?.cwd || (project !== 'all' ? project : '')); setNewTask(true); }}><Plus size={19} /></IconButton><span className={`live-label ${connection}`}><span className="connection-dot" />{connection === 'online' ? '实时同步' : connection === 'connecting' ? '正在连接' : '连接中断'}</span><button type="button" className={`notification-entry ${notifications.allowed ? 'enabled' : ''}`} aria-label={notificationLabel} title="等待确认时发送系统通知，点击设置" onClick={() => { setNotificationsOpen(true); if (!notifications.allowed) void notifications.enable(); }}><Bell size={15} /><span>{notificationLabel}</span></button></div></header>
       {snapshot.demo && <div className="demo-banner">演示模式 · 当前显示模拟任务，操作不会影响真实 Codex 会话。</div>}
       {connection === 'offline' && <div className="connection-banner"><Unplug size={16} />工作台连接已断开，正在重连。任务继续在 Codex 中运行，恢复连接后再操作。</div>}
       {snapshot.sources.filter(s => s.error || s.localWarning).map(s => <div className="connection-banner" key={s.id}><Unplug size={16} /><span>{s.name}：{s.error || s.localWarning}</span></div>)}
@@ -253,11 +278,19 @@ export default function App() {
             {!activeTurn && detail?.turns[0] && <div className="turn-indicator"><CheckCheck size={16} /><span>{detail.turns[0].status === 'completed' ? '本轮已完成' : detail.turns[0].status === 'interrupted' ? '本轮已停止' : detail.turns[0].status === 'failed' ? '本轮执行失败' : detail.turns[0].status}</span><time>{time(detail.turns[0].completedAt)}</time>{detail.turns[0].error && <p>{detail.turns[0].error}</p>}</div>}
           </div>
           {queued.length > 0 && <div className="queue-list">{queued.map(q => <div key={q.id}><Clock3 size={15} /><span><b>{q.status === 'queued' ? '等待本轮结束' : q.status === 'sending' ? '正在发送' : q.status === 'uncertain' ? '发送结果待确认' : '发送已暂停'}</b><small title={q.text}>{q.error ? `${q.error} · ${q.text}` : q.text}</small></span><IconButton label="移除队列消息" disabled={busy || q.status === 'sending'} onClick={() => setConfirm({ title: '移除这条队列消息？', message: q.status === 'uncertain' ? '移除记录不会撤回可能已经送达 Codex 的消息，请先查看会话结果。' : '移除后，这条消息不会自动发送。', action: async () => { await api(`queue/${q.id}/cancel`, {}); } })}><X size={15} /></IconButton></div>)}</div>}
-          {selected.detached ? <div className="resume-bar"><div><Unplug size={18} /><span>已退出面板连接 · 历史记录保留</span></div><button className="button primary" disabled={!connected || busy} onClick={() => void act(async () => { const thread = await api<ThreadSummary>(`${endpoint(selected)}/resume`, {}); setSnapshot(current => ({ ...current, threads: current.threads.map(item => item.key === thread.key ? thread : item) })); setNotice('已重新接入'); await refreshDetail(true, true); })}>重新接入</button></div> : selected.externalPid ? <div className="resume-bar external-session"><div><Terminal size={18} /><span>终端独立运行 · 接入后可在面板对话与确认权限</span></div><button className="button primary" disabled={!connected || busy} onClick={() => { setError(''); setConnectTarget(selected); }}>接入交互</button></div> : selected.state === 'history' ? <div className="resume-bar"><div><Clock3 size={18} /><span>历史会话 · 连接后可继续对话</span></div><button className="button primary" disabled={!connected || busy} onClick={() => setConfirm({ title: '连接这段历史会话？', message: '将在当前 Codex 服务中恢复上下文。若原独立终端仍在执行这段会话，请先停止原执行，避免两个服务同时写入。', action: async () => { await api(`${endpoint(selected)}/resume`, {}); setNotice('会话已连接'); await refreshDetail(true); } })}>连接会话</button></div> : <form className="composer" onSubmit={send}><textarea aria-label="给 Codex 发送指令" placeholder={connected ? running ? '补充说明，或安排下一步工作…' : '输入指令，继续这段会话…' : '连接恢复后即可发送指令'} value={text} onChange={e => setText(e.target.value)} disabled={!connected || busy} onKeyDown={e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') send(e); }} /><div className="composer-bottom"><div>{running && <select aria-label="指令发送方式" value={mode} onChange={e => setMode(e.target.value)}><option value="queue">本轮结束后发送</option><option value="steer">立即补充当前任务</option></select>}{!running && <span className="composer-hint">⌘ / Ctrl + Enter 发送</span>}</div><div className="composer-actions">{running && <button type="button" className="button stop" disabled={!connected || busy || !activeTurn} onClick={() => setConfirm({ title: '停止当前执行？', message: '会请求 Codex 中断当前轮次，同时暂停本会话的待发送队列。已完成的文件修改会保留。', action: async () => { await api(`${endpoint(selected)}/interrupt`, { turnId: activeTurn?.id }); setNotice('已请求停止，等待 Codex 确认'); await refreshDetail(); } })}><Square size={13} />停止</button>}<button className="button primary" type="submit" disabled={!connected || busy || !text.trim() || (running && mode === 'steer' && !activeTurn)}>{busy ? <LoaderCircle size={16} className="spin" /> : <Send size={15} />}{running && mode === 'queue' ? '加入队列' : '发送'}</button></div></div></form>}
+          {selected.detached ? <div className="resume-bar"><div><Unplug size={18} /><span>已退出面板连接 · 历史记录保留</span></div><button className="button primary" disabled={!connected || busy} onClick={() => void act(async () => { const thread = await api<ThreadSummary>(`${endpoint(selected)}/resume`, {}); setSnapshot(current => ({ ...current, threads: current.threads.map(item => item.key === thread.key ? thread : item) })); setNotice('已重新接入'); await refreshDetail(true, true); })}>重新接入</button></div> : selected.externalPid ? <div className="resume-bar external-session"><div><Terminal size={18} /><span>终端独立运行 · 接入后可在面板对话与确认权限</span></div><button className="button primary" disabled={!connected || busy} onClick={() => { setError(''); setConnectTarget(selected); }}>接入交互</button></div> : selected.state === 'history' ? <div className="resume-bar"><div><Clock3 size={18} /><span>历史会话 · 连接后可继续对话</span></div><button className="button primary" disabled={!connected || busy} onClick={() => setConfirm({ title: '连接这段历史会话？', message: '将在当前 Codex 服务中恢复上下文。若原独立终端仍在执行这段会话，请先停止原执行，避免两个服务同时写入。', action: async () => { await api(`${endpoint(selected)}/resume`, {}); setNotice('会话已连接'); await refreshDetail(true); } })}>连接会话</button></div> : <form className="composer" onSubmit={send}><textarea aria-label="给 Codex 发送指令" placeholder={connected ? running ? '补充说明，或安排下一步工作…' : '输入指令，继续这段会话…' : '连接恢复后即可发送指令'} value={text} onChange={e => setText(e.target.value)} disabled={!connected || busy} onKeyDown={composerKeyDown} /><div className="composer-bottom"><div>{running && <select aria-label="指令发送方式" value={mode} onChange={e => setMode(e.target.value)}><option value="queue">本轮结束后发送</option><option value="steer">立即补充当前任务</option></select>}{!running && <span className="composer-hint">Enter 发送 · ⌘ / Ctrl + Enter 换行</span>}</div><div className="composer-actions">{running && <button type="button" className="button stop" disabled={!connected || busy || !activeTurn} onClick={() => setConfirm({ title: '停止当前执行？', message: '会请求 Codex 中断当前轮次，同时暂停本会话的待发送队列。已完成的文件修改会保留。', action: async () => { await api(`${endpoint(selected)}/interrupt`, { turnId: activeTurn?.id }); setNotice('已请求停止，等待 Codex 确认'); await refreshDetail(); } })}><Square size={13} />停止</button>}<button className="button primary" type="submit" disabled={!canSend}>{busy ? <LoaderCircle size={16} className="spin" /> : <Send size={15} />}{running && mode === 'queue' ? '加入队列' : '发送'}</button></div></div></form>}
         </> : <div className="detail-empty"><div className="empty-art"><Terminal size={32} /><span /><i /></div><div className="eyebrow">YOUR WORK, IN VIEW</div><h2>选一个任务，看看进展</h2><p>查看对话、执行记录和文件变更，<br />也可以直接回复确认或安排下一步工作。</p><div className="empty-features"><span><Activity size={15} />执行动态</span><span><ShieldCheck size={15} />待处理确认</span><span><MessageSquare size={15} />继续对话</span></div></div>}</section>
       </section>
     </main>
     {error && <div className="toast error" role="alert"><span>{error}</span><IconButton label="关闭错误提示" onClick={() => setError('')}><X size={16} /></IconButton></div>}{notice && <div className="toast" role="status"><Check size={17} /><span>{notice}</span></div>}
+    {notificationsOpen && <Modal title="通知提醒" close={() => setNotificationsOpen(false)}><div className="notification-settings">
+      <p><strong>{notifications.allowed ? '已获得浏览器通知权限' : notifications.permission === 'denied' ? '通知已被浏览器阻止' : notifications.permission === 'unsupported' ? '当前浏览器不支持系统通知' : '开启后，切到其他软件也能收到提醒'}</strong></p>
+      <p>权限确认和需要你回答的问题会触发提醒，点击通知可返回对应任务。同一条请求只提醒一次，处理后自动移除。</p>
+      {notifications.permission === 'denied' && <p className="inline-error">请在浏览器的网站设置中允许此页面发送通知，然后回到这里。</p>}
+      {notifications.error && <p className="inline-error" role="alert">{notifications.error}</p>}
+      <p className="muted">请保持工作台页面打开，可切换窗口或放到后台。若测试通知没有弹出，请检查系统是否允许浏览器通知，以及是否开启了专注模式。</p>
+      <div className="modal-actions">{notifications.allowed ? <><button className="button" onClick={notifications.disable}>暂停提醒</button>{notifications.error && <button className="button" onClick={notifications.retry}>重试待确认通知</button>}<button className="button primary" onClick={notifications.test}>发送测试通知</button></> : <button className="button primary" disabled={notifications.requesting || ['denied', 'unsupported'].includes(notifications.permission)} onClick={() => void notifications.enable()}>{notifications.requesting ? '等待浏览器授权…' : '开启系统通知'}</button>}</div>
+    </div></Modal>}
     {approvalCenter && <Modal title="权限确认" close={() => { if (!busy) setApprovalCenter(false); }}><div className="approval-center">{snapshot.pending.length ? snapshot.pending.map(request => { const thread = snapshot.threads.find(t => t.sourceId === request.sourceId && t.id === request.threadId); const source = snapshot.sources.find(s => s.id === request.sourceId); return <section className="approval-center-item" key={request.key}><div className="approval-context"><strong>{thread?.title || request.threadId || '当前请求'}</strong>{thread && <button className="button" onClick={() => { choose(thread); setShowChildren(true); setApprovalCenter(false); }}>查看任务</button>}<code>Session ID: {thread?.sessionId || request.threadId || '未提供'}</code><code>CODEX_HOME: {source?.codexHome || '未提供'}</code></div><RequestCard request={request} reply={reply} busy={busy || connection !== 'online' || !source?.connected} /></section>; }) : <div className="approval-empty"><ShieldCheck size={28} /><strong>当前没有可处理的权限请求</strong><p>收到命令执行、文件修改等确认后，会显示在这里。</p><p>独立终端会话可从任务详情的“接入交互”切换到共享服务，之后在这里处理确认。</p></div>}</div></Modal>}
     {target && <Modal title="终端与面板交互" close={() => { if (!busy) setConnectTarget(null); }}><div className="connect-session">{error && <div className="inline-error" role="alert">{error}</div>}<p><strong>{target.title}</strong></p><ThreadIdentity thread={target} />{target.externalPid ? <><p>这段会话当前运行在独立终端。接入共享服务后，终端与面板可以共同发送消息、回答问题和确认权限。</p><ol><li>在原终端完成或停止当前执行，然后输入 <code>/exit</code> 退出 Codex。</li><li>只在面板继续：点击下方“接入面板”。保留终端交互：退出后在终端执行下面的命令。</li></ol><p className="muted">保留原会话与记录。面板会检查原进程是否已退出；不会强制结束正在运行的任务。</p></> : <p>此命令在终端打开同一服务中的原会话，可与面板共同对话、处理权限确认。</p>}{targetCommand && <div className="terminal-command"><pre>{targetCommand}</pre><button className="button" disabled={busy} onClick={() => void act(async () => { await navigator.clipboard.writeText(targetCommand); setNotice('双端交互命令已复制'); })}>复制命令</button></div>}{!targetCommand && <p className="muted">当前来源未提供终端地址。</p>}<div className="modal-actions"><button className="button" disabled={busy} onClick={() => setConnectTarget(null)}>关闭</button>{(target.externalPid || target.state === 'history') && <button className="button primary" disabled={busy || connection !== 'online' || !targetSource?.connected} onClick={() => void act(async () => { const thread = await api<ThreadSummary>(`${endpoint(target)}/resume`, {}); setSnapshot(s => ({ ...s, threads: s.threads.map(t => t.key === thread.key ? thread : t) })); choose(thread); setConnectTarget(null); setNotice('已接入，可在面板继续对话'); await refreshDetail(true); })}>{busy ? '正在接入…' : '接入面板'}</button>}</div></div></Modal>}
     {renameTarget && <Modal title="修改对话标题" close={() => { if (!busy) setRenameTarget(null); }}>{error && <div className="inline-error" role="alert">{error}</div>}<form onSubmit={e => { e.preventDefault(); void act(async () => { const title = validateTitle(newTitle); const thread = await api<ThreadSummary>(`${endpoint(renameTarget)}/rename`, { title }); setSnapshot(s => ({ ...s, threads: s.threads.map(t => t.key === thread.key ? { ...t, title: thread.title } : t) })); setDetail(current => current?.thread.key === thread.key ? { ...current, thread: { ...current.thread, title: thread.title } } : current); setRenameTarget(null); setNotice('标题已保存'); }); }}><label className="form-field">对话标题<input autoFocus required maxLength={MAX_TITLE_LENGTH} value={newTitle} onFocus={e => e.target.select()} onChange={e => setNewTitle(e.target.value)} disabled={busy} /></label><p className="title-limit">{newTitle.length} / {MAX_TITLE_LENGTH}</p><div className="modal-actions"><button type="button" className="button" disabled={busy} onClick={() => setRenameTarget(null)}>取消</button><button type="submit" className="button primary" disabled={busy || !supportsRename || connection !== 'online' || !snapshot.sources.find(s => s.id === renameTarget.sourceId)?.connected || !snapshot.threads.some(t => t.key === renameTarget.key) || !newTitle.trim() || newTitle.trim() === renameTarget.title || newTitle.trim().length > MAX_TITLE_LENGTH}>{busy ? '正在保存…' : '保存标题'}</button></div></form></Modal>}

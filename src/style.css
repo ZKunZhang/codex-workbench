@@ -3207,3 +3207,38 @@ h2 {
   background: #f1f5f4;
   color: var(--primary);
 }
+
+.notification-entry {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #fff;
+  color: #73818b;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.notification-entry.enabled {
+  color: var(--primary);
+  background: #f3faf6;
+  border-color: #dcece2;
+}
+
+.notification-settings {
+  display: grid;
+  gap: 12px;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+@media (max-width: 800px) {
+  .notification-entry {
+    padding: 5px;
+  }
+  .notification-entry > span {
+    display: none;
+  }
+}

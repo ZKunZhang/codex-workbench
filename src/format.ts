@@ -4,7 +4,12 @@ export const stateLabels: Record<RuntimeState, string> = { running: '执行中',
 export const priority: Record<RuntimeState, number> = { approval: 0, input: 1, error: 2, running: 3, idle: 4, unknown: 5, history: 6 };
 export const basename = (path: string) => path.split('/').filter(Boolean).at(-1) || path;
 export const endpoint = (thread: ThreadSummary) => `threads/${encodeURIComponent(thread.sourceId)}/${encodeURIComponent(thread.id)}`;
-export const time = (value?: number | null) => value ? new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : '—';
+const timestampFormat = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+export function time(value?: number | null) {
+  if (!value) return '—';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '—' : timestampFormat.format(date);
+}
 export function relative(value: number, now = Date.now()) {
   const minutes = Math.max(0, Math.floor((now - value) / 60000));
   return minutes < 1 ? '刚刚' : minutes < 60 ? `${minutes} 分钟前` : minutes < 1440 ? `${Math.floor(minutes / 60)} 小时前` : `${Math.floor(minutes / 1440)} 天前`;

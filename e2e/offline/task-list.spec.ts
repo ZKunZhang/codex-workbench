@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page, type WebSocketRoute } from '@playwright/test';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -17,12 +17,14 @@ async function offlineWorkbench(page: Page, legacy = false, extraThreads = 0) {
   const workbench = new Workbench([{ id: 'demo', name: '默认配置', socket: '/demo/app-server.sock' }, { id: 'api', name: 'API 配置' }], new StateStore(join(folder, 'state.json')), true, source => source.id === 'demo' ? client : other);
   workbench.start();
   await expect.poll(() => workbench.snapshot().sources.every(source => !!source.lastSync)).toBe(true);
-  await page.routeWebSocket('ws://workbench.test/events', socket => {
+  const sockets = new Set<WebSocketRoute>();
+  await page.routeWebSocket('ws://workbench.localhost/events', socket => {
+    sockets.add(socket);
     const update = (snapshot = workbench.snapshot()) => socket.send(JSON.stringify(snapshot));
     workbench.on('change', update); update();
-    socket.onClose(() => workbench.off('change', update));
+    socket.onClose(() => { sockets.delete(socket); workbench.off('change', update); });
   });
-  await page.route('http://workbench.test/**', async route => {
+  await page.route('http://workbench.localhost/**', async route => {
     const url = new URL(route.request().url());
     const path = url.pathname;
     try {
@@ -44,7 +46,68 @@ async function offlineWorkbench(page: Page, legacy = false, extraThreads = 0) {
   });
   await page.goto('/');
   await expect(page.locator('.task-row')).toHaveCount(7 + extraThreads);
-  return Object.assign(() => workbench.stop(), { client, workbench });
+  return Object.assign(() => workbench.stop(), { client, workbench, disconnect: () => { for (const socket of sockets) socket.close(); } });
+}
+
+test('composer Enter sends once, preserves queue mode, and ignores empty drafts, IME confirmation and held keys', async ({ page }) => {
+  const stop = await offlineWorkbench(page);
+  const messages: { text: string; mode: string }[] = [];
+  await page.route('**/api/threads/demo/*/message', route => {
+    messages.push(route.request().postDataJSON());
+    return route.fulfill({ json: { ok: true } });
+  });
+  try {
+    await page.locator('.task-row[data-thread-id="task-idle"]').click();
+    const draft = page.getByRole('textbox', { name: '给 Codex 发送指令' });
+    await expect(page.locator('.composer-hint')).toHaveText('Enter 发送 · ⌘ / Ctrl + Enter 换行');
+    await draft.press('Enter');
+    await expect(draft).toHaveValue('');
+    await draft.fill('中文确认后发送');
+    await draft.dispatchEvent('keydown', { key: 'Enter', code: 'Enter', isComposing: true });
+    await draft.dispatchEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 229 });
+    await draft.dispatchEvent('keydown', { key: 'Enter', code: 'Enter', repeat: true });
+    await expect(draft).toHaveValue('中文确认后发送');
+    expect(messages).toHaveLength(0);
+    await draft.press('Enter');
+    await expect(draft).toHaveValue('');
+    expect(messages).toMatchObject([{ text: '中文确认后发送', mode: 'send' }]);
+    await page.locator('.task-row[data-thread-id="task-running"]').click();
+    await draft.fill('完成后继续下一步');
+    await draft.press('Enter');
+    await expect(draft).toHaveValue('');
+    expect(messages).toMatchObject([{ text: '中文确认后发送', mode: 'send' }, { text: '完成后继续下一步', mode: 'queue' }]);
+  } finally { stop(); }
+});
+
+for (const modifier of ['Meta', 'Control']) {
+  test(`composer ${modifier}+Enter inserts a newline at the caret or selection without sending`, async ({ page }) => {
+    const stop = await offlineWorkbench(page);
+    const messages: { text: string }[] = [];
+    await page.route('**/api/threads/demo/task-idle/message', route => {
+      messages.push(route.request().postDataJSON());
+      return route.fulfill({ json: { ok: true } });
+    });
+    try {
+      await page.locator('.task-row[data-thread-id="task-idle"]').click();
+      const draft = page.getByRole('textbox', { name: '给 Codex 发送指令' });
+      await draft.fill('abcdef');
+      await draft.evaluate((input: HTMLTextAreaElement) => input.setSelectionRange(3, 3));
+      await draft.press(`${modifier}+Enter`);
+      await expect(draft).toHaveValue('abc\ndef');
+      expect(await draft.evaluate((input: HTMLTextAreaElement) => input.selectionStart)).toBe(4);
+      await page.keyboard.insertText('中');
+      await expect(draft).toHaveValue('abc\n中def');
+      await draft.evaluate((input: HTMLTextAreaElement) => input.setSelectionRange(2, 5));
+      await draft.press(`${modifier}+Enter`);
+      await expect(draft).toHaveValue('ab\ndef');
+      await draft.press('Shift+Enter');
+      await expect(draft).toHaveValue('ab\n\ndef');
+      expect(messages).toHaveLength(0);
+      await draft.press('Enter');
+      await expect(draft).toHaveValue('');
+      expect(messages).toMatchObject([{ text: 'ab\n\ndef' }]);
+    } finally { stop(); }
+  });
 }
 
 test('list deletion preserves another selected conversation and draft, handles failure, and removes descendants only in its source', async ({ page }) => {
@@ -286,6 +349,15 @@ test('large task lists keep drafts and child tasks intact through updates to one
       await expect(page.locator('.task-row[data-thread-id="task-running"] h3')).toHaveText(thread.title);
     }
     const after = await metrics();
+    // Reusing source labels must not hide actual name or connection changes.
+    snapshot.sources[0].name = '更新后的来源';
+    snapshot.sources[0].connected = false;
+    stop.workbench.emit('change', snapshot);
+    await expect(page.locator('.task-row[data-thread-id="task-idle"] .task-source')).toHaveText('更新后的来源');
+    await expect(page.getByRole('button', { name: '删除对话：修复上传组件的错误提示', exact: true })).toBeDisabled();
+    snapshot.sources[0].connected = true;
+    stop.workbench.emit('change', snapshot);
+    await expect(page.getByRole('button', { name: '删除对话：修复上传组件的错误提示', exact: true })).toBeEnabled();
     await expect(page.locator('.task-row')).toHaveCount(308);
     await expect(page.locator('.task-children .task-row[data-thread-id="history-child"]')).toHaveCount(1);
     await expect(draft).toHaveValue('更新期间保留草稿');
@@ -293,4 +365,125 @@ test('large task lists keep drafts and child tasks intact through updates to one
     await writeFile(samplePath, JSON.stringify({ scenario: 'Chromium, 308 tasks, 30 snapshots updating one task; accumulated browser main-thread seconds, not live Safari CPU percentage', taskSeconds: after.TaskDuration - before.TaskDuration, scriptSeconds: after.ScriptDuration - before.ScriptDuration, layoutSeconds: after.LayoutDuration - before.LayoutDuration }, null, 2));
     await testInfo.attach('cpu-sample.json', { path: samplePath, contentType: 'application/json' });
   } finally { await cdp.detach(); stop(); }
+});
+
+async function mockNotifications(page: Page, permission: 'default' | 'granted' | 'denied' | 'unsupported' = 'default', fail = false) {
+  await page.addInitScript(({ permission, fail }) => {
+    const entries: any[] = [];
+    class MockNotification {
+      static permission = permission;
+      static requests = 0;
+      static fail = fail;
+      static async requestPermission() { this.requests++; this.permission = 'granted'; return this.permission; }
+      title: string; options: NotificationOptions; closed = false;
+      onclick: ((event: Event) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor(title: string, options: NotificationOptions) {
+        if (MockNotification.fail) throw new Error('notification unavailable');
+        this.title = title; this.options = options; entries.push(this);
+      }
+      close() { this.closed = true; this.onclose?.(); }
+    }
+    Object.defineProperty(window, 'Notification', { configurable: true, value: permission === 'unsupported' ? undefined : MockNotification });
+    Object.assign(window, { notificationTestEntries: entries, notificationTestFocusCalls: 0 });
+    window.focus = () => { (window as any).notificationTestFocusCalls++; };
+  }, { permission, fail });
+}
+
+const notificationEntries = (page: Page) => page.evaluate(() => (window as any).notificationTestEntries.map((entry: any) => ({ title: entry.title, body: entry.options.body, tag: entry.options.tag, closed: entry.closed })));
+
+test('system notifications require a user gesture, include existing requests, and work while hidden without duplicates', async ({ page }) => {
+  await mockNotifications(page);
+  const stop = await offlineWorkbench(page);
+  try {
+    await expect(page.locator('.approval-entry b')).toHaveText('2');
+    expect(await notificationEntries(page)).toHaveLength(0);
+    expect(await page.evaluate(() => (Notification as any).requests)).toBe(0);
+    await page.getByRole('button', { name: '开启通知', exact: true }).click();
+    await expect(page.getByRole('button', { name: '通知已开启', exact: true })).toBeVisible();
+    await expect.poll(async () => (await notificationEntries(page)).length).toBe(2);
+    expect(await page.evaluate(() => (Notification as any).requests)).toBe(1);
+    expect((await notificationEntries(page)).map((entry: any) => entry.title).sort()).toEqual(['Codex 等待你回答', 'Codex 等待确认']);
+    await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+    await expect.poll(async () => (await notificationEntries(page)).length).toBe(3);
+    await page.getByRole('button', { name: '关闭弹窗', exact: true }).click();
+    await page.getByRole('button', { name: '收藏任务', exact: true }).click();
+    await expect(page.locator('.task-row')).toHaveCount(0);
+    await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: true }); document.dispatchEvent(new Event('visibilitychange')); });
+    stop.client.emit('request', { id: 'background-file', method: 'item/fileChange/requestApproval', params: { threadId: 'history-child', turnId: 'turn-child', itemId: 'file-child', reason: 'private-details-not-in-notification' } });
+    await expect.poll(async () => (await notificationEntries(page)).length).toBe(4);
+    const latest = (await notificationEntries(page)).at(-1);
+    expect(latest.body).toContain('历史子任务');
+    expect(latest.body).not.toContain('private-details-not-in-notification');
+    expect(latest.tag).toContain('background-file');
+    await expect(page).toHaveTitle('(3 待确认) Codex 工作台');
+    stop.workbench.emit('change', JSON.parse(JSON.stringify(stop.workbench.snapshot())));
+    await expect(page.locator('.approval-entry b')).toHaveText('3');
+    expect(await notificationEntries(page)).toHaveLength(4);
+    await page.evaluate(() => {
+      Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+      (window as any).notificationTestEntries.at(-1).onclick(new Event('click', { cancelable: true }));
+    });
+    await expect(page.locator('.detail-title h2')).toHaveText('历史子任务');
+    await expect(page.locator('.approval-panel .request-card')).toHaveCount(1);
+    await expect(page.locator('.task-children .task-row[data-thread-id="history-child"]')).toBeVisible();
+    expect(await page.evaluate(() => (window as any).notificationTestFocusCalls)).toBe(1);
+    stop.client.emit('request', { id: 'resolve-notification', method: 'item/commandExecution/requestApproval', params: { threadId: 'task-idle', turnId: 'turn-idle', itemId: 'command-idle', command: 'echo private' } });
+    await expect.poll(async () => (await notificationEntries(page)).length).toBe(5);
+    stop.client.notify('serverRequest/resolved', { threadId: 'task-idle', requestId: 'resolve-notification' });
+    await expect.poll(async () => (await notificationEntries(page)).at(-1).closed).toBe(true);
+  } finally { stop(); }
+});
+
+test('pausing notifications persists across reloads and resuming catches pending requests', async ({ page }) => {
+  await mockNotifications(page, 'granted');
+  const stop = await offlineWorkbench(page);
+  try {
+    await expect.poll(async () => (await notificationEntries(page)).length).toBe(2);
+    await page.getByRole('button', { name: '通知已开启', exact: true }).click();
+    await page.getByRole('button', { name: '暂停提醒', exact: true }).click();
+    await expect.poll(async () => (await notificationEntries(page)).every((entry: any) => entry.closed)).toBe(true);
+    await page.reload();
+    await expect(page.locator('.approval-entry b')).toHaveText('2');
+    expect(await notificationEntries(page)).toHaveLength(0);
+    await page.getByRole('button', { name: '开启通知', exact: true }).click();
+    await expect.poll(async () => (await notificationEntries(page)).length).toBe(2);
+    expect(await page.evaluate(() => (Notification as any).requests)).toBe(0);
+  } finally { stop(); }
+});
+
+for (const permission of ['denied', 'unsupported', 'granted'] as const) test(`notification ${permission === 'granted' ? 'delivery failures' : permission} state is visible and never blocks approvals`, async ({ page }) => {
+  await mockNotifications(page, permission, permission === 'granted');
+  const stop = await offlineWorkbench(page);
+  try {
+    const label = permission === 'denied' ? '通知被阻止' : permission === 'unsupported' ? '通知不可用' : '通知异常';
+    await page.getByRole('button', { name: label, exact: true }).click();
+    await expect(page.getByRole('dialog')).toContainText(permission === 'denied' ? '请在浏览器的网站设置' : permission === 'unsupported' ? '当前浏览器不支持' : '系统通知未能显示');
+    if (permission !== 'unsupported') expect(await page.evaluate(() => (Notification as any).requests)).toBe(0);
+    if (permission === 'granted') {
+      await page.evaluate(() => { (Notification as any).fail = false; });
+      await page.getByRole('button', { name: '重试待确认通知', exact: true }).click();
+      await expect.poll(async () => (await notificationEntries(page)).length).toBe(2);
+      await expect(page.getByRole('button', { name: '通知已开启', exact: true })).toBeVisible();
+    }
+    await page.getByRole('button', { name: '关闭弹窗', exact: true }).click();
+    await page.locator('.task-row[data-thread-id="task-approval"]').click();
+    await expect(page.locator('.approval-panel').getByRole('button', { name: '允许本次', exact: true })).toBeEnabled();
+  } finally { stop(); }
+});
+
+
+test('reconnecting restores pending notifications that were closed on disconnect', async ({ page }) => {
+  await mockNotifications(page, 'granted');
+  const stop = await offlineWorkbench(page);
+  try {
+    await expect.poll(async () => (await notificationEntries(page)).length).toBe(2);
+    stop.disconnect();
+    await expect(page.locator('.connection-banner')).toContainText('工作台连接已断开');
+    await expect.poll(async () => (await notificationEntries(page)).every((entry: any) => entry.closed)).toBe(true);
+    await expect.poll(async () => (await notificationEntries(page)).length).toBe(4);
+    await expect(page).toHaveTitle('(2 待确认) Codex 工作台');
+    expect((await notificationEntries(page)).slice(2).every((entry: any) => !entry.closed)).toBe(true);
+  } finally { stop(); }
 });
